@@ -205,6 +205,7 @@ struct omap4_hwc_device {
 
     enum S3DLayoutType s3d_input_type;
     enum S3DLayoutOrder s3d_input_order;
+    int use_wb_s3d;
 
     enum bltmode blt_mode;
     enum bltpolicy blt_policy;
@@ -1147,6 +1148,7 @@ static void gather_layer_statistics(omap4_hwc_device_t *hwc_dev, struct counts *
         if (omap4_hwc_is_valid_layer(hwc_dev, layer, handle)) {
 
             if (s3d_layout_type != eMono) {
+                if(!hwc_dev->use_wb_s3d) {
                 /* For now we can only handle 1 S3D layer, skip any additional ones */
                 if (num->s3d > 0 || !hwc_dev->ext.dock.enabled || !hwc_dev->ext.s3d_capable) {
                     layer->flags |= HWC_SKIP_LAYER;
@@ -1155,7 +1157,15 @@ static void gather_layer_statistics(omap4_hwc_device_t *hwc_dev, struct counts *
                     /* For now, S3D layer is made a dockable layer to trigger docking logic. */
                     if (!dockable(layer)) {
                         num->dockable++;
+                        }
+                        num->s3d++;
+                        // Current scenario is one S3D layer. Note: A
+                        // later enhancement to change this to an array.
+                        hwc_dev->s3d_input_type = s3d_layout_type;
+                        hwc_dev->s3d_input_order = get_s3d_layout_order(layer);
                     }
+                } else {
+                    /* use_wb_s3d case */
                     num->s3d++;
                     hwc_dev->s3d_input_type = s3d_layout_type;
                     hwc_dev->s3d_input_order = get_s3d_layout_order(layer);
@@ -1526,6 +1536,8 @@ clone_s3d_external_layer(omap4_hwc_device_t *hwc_dev, int ix_s3d)
     omap4_hwc_adjust_ext_s3d_layer(hwc_dev, &dsscomp->ovls[dsscomp->num_ovls - 1], true);
     omap4_hwc_adjust_ext_s3d_layer(hwc_dev, &dsscomp->ovls[dsscomp->num_ovls - 2], false);
 
+    /* No WB when an HDMI is plugged in. */
+    hwc_dev->use_wb_s3d = 0;
     return 0;
 }
 
@@ -1715,14 +1727,32 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
     struct dsscomp_setup_dispc_data *dsscomp = &hwc_dev->comp_data.dsscomp_data;
     struct counts num = { .composited_layers = list ? list->numHwLayers : 0 };
     unsigned int i, ix;
+    unsigned int s3d_gfx_z = 0;
 
     pthread_mutex_lock(&hwc_dev->lock);
     memset(dsscomp, 0x0, sizeof(*dsscomp));
     dsscomp->sync_id = sync_id++;
 
+    hwc_dev->use_wb_s3d = 0;
+
+    dsscomp->composition_mode = DSSCOMP_NORMAL_COMPOSITION;
+
+    if ((hwc_dev->ext.dock.enabled && hwc_dev->ext.s3d_capable)
+        || (list->numHwLayers > 3)
+        || (hwc_dev->fb_dis.s3d_info.type != S3D_DISP_ROW_IL)) {
+        hwc_dev->use_wb_s3d = 0;
+    } else {
+        hwc_dev->use_wb_s3d = 1;
+    }
+
+
     gather_layer_statistics(hwc_dev, &num, list);
 
     decide_supported_cloning(hwc_dev, &num);
+
+    if(num.s3d <= 0) {
+        hwc_dev->use_wb_s3d = 0;
+    }
 
     /* phase 3 logic */
     if (can_dss_render_all(hwc_dev, &num)) {
@@ -1730,6 +1760,7 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
         hwc_dev->use_sgx = 0;
         hwc_dev->swap_rb = num.BGR != 0;
     } else {
+        hwc_dev->use_wb_s3d = 0;
         /* Use SGX for composition plus first 3 layers that are DSS renderable */
         hwc_dev->use_sgx = 1;
         hwc_dev->swap_rb = is_BGR_format(hwc_dev->fb_dev->base.format);
@@ -1769,6 +1800,8 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
     for (i = 0; list && i < list->numHwLayers && !blit_all; i++) {
         hwc_layer_t *layer = &list->hwLayers[i];
         IMG_native_handle_t *handle = (IMG_native_handle_t *)layer->handle;
+        __u32 s3d_layout_type = get_s3d_layout_type(layer);
+        __u32 s3d_layout_order = get_s3d_layout_order(layer);
 
         if (dsscomp->num_ovls < num.max_hw_overlays &&
             can_dss_render_layer(hwc_dev, layer) &&
@@ -1809,15 +1842,38 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
             dsscomp->ovls[dsscomp->num_ovls].cfg.ix = dsscomp->num_ovls + hwc_dev->primary_transform;
             dsscomp->ovls[dsscomp->num_ovls].addressing = OMAP_DSS_BUFADDR_LAYER_IX;
             dsscomp->ovls[dsscomp->num_ovls].ba = dsscomp->num_ovls;
+            /* by default a layer is not S3D */
+            dsscomp->ovls[dsscomp->num_ovls].cfg.s3d_content = 0;
+            dsscomp->ovls[dsscomp->num_ovls].cfg.s3d_input_layout_type = MONO;
+            if(s3d_layout_type != eMono) {
+                dsscomp->ovls[dsscomp->num_ovls].cfg.s3d_content = 1;
+                dsscomp->ovls[dsscomp->num_ovls].cfg.s3d_input_layout_type
+                        = s3d_layout_type;
+                dsscomp->ovls[dsscomp->num_ovls].cfg.s3d_input_layout_order
+                        = s3d_layout_order;
+                /* if the S3D layer is on GFX pipeline, store its z value
+                 * for swapping to the last free VIDx pipeline later.
+                 */
+                if(dsscomp->num_ovls == 0) {
+                        s3d_gfx_z = z;
+                }
+            }
 
             /* ensure GFX layer is never scaled */
             if ((dsscomp->num_ovls == 0) && (!hwc_dev->primary_transform)) {
                 scaled_gfx = scaled(layer) || is_NV12(handle);
             } else if (scaled_gfx && !scaled(layer) && !is_NV12(handle)) {
+                /* In S3D WB case, GFX is used for other purposes. So
+                 * when using WB for S3D, do not keep any layer on GFX.
+                 * Hence we must avoid swapping in a layer on to the GFX
+                 * pipeline.
+                 */
+                    if(!hwc_dev->use_wb_s3d) {
                 /* swap GFX layer with this one */
                 dsscomp->ovls[dsscomp->num_ovls].cfg.ix = 0;
                 dsscomp->ovls[0].cfg.ix = dsscomp->num_ovls;
                 scaled_gfx = 0;
+                    }
             }
 
             /* remember largest dockable layer */
@@ -1846,8 +1902,13 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
     }
 
     /* if scaling GFX (e.g. only 1 scaled surface) use a VID pipe */
-    if (scaled_gfx)
+    if (scaled_gfx) {
         dsscomp->ovls[0].cfg.ix = dsscomp->num_ovls;
+        if(hwc_dev->use_wb_s3d && (num.s3d > 0)) {
+            dsscomp->ovls[0].cfg.zorder = s3d_gfx_z;
+            hwc_dev->use_sgx = 0;
+        }
+    }
 
     if (hwc_dev->blt_policy == BLTPOLICY_DEFAULT) {
         if (hwc_dev->use_sgx) {
@@ -1966,6 +2027,10 @@ static int omap4_hwc_prepare(struct hwc_composer_device *dev, hwc_layer_list_t* 
         ix |= 1 << c->ix;
     }
     dsscomp->mode = DSSCOMP_SETUP_DISPLAY;
+        if(hwc_dev->use_wb_s3d && (num.s3d > 0)) {
+            dsscomp->composition_mode = DSSCOMP_WB_M2M_ROW_INTERLEAVED;
+        }
+
     dsscomp->mgrs[0].ix = 0;
     dsscomp->mgrs[0].alpha_blending = 1;
     dsscomp->mgrs[0].swap_rb = hwc_dev->swap_rb;
